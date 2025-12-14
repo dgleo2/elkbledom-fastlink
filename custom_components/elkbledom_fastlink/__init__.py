@@ -24,7 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ELK-BLEDOM from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Получаем параметры (опции приоритетнее)
+    # Retrieve parameters (options override config data)
     reset = entry.options.get(CONF_RESET, entry.data.get(CONF_RESET, False))
     delay = entry.options.get(CONF_DELAY, entry.data.get(CONF_DELAY, 120))
     mac = entry.data.get(CONF_MAC) or entry.options.get(CONF_MAC)

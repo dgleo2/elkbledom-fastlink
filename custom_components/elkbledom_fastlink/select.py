@@ -66,8 +66,7 @@ class BLEDOMBrightnessModeSelect(SelectEntity):
         data[CONF_BRIGHTNESS_MODE] = option
         self.hass.config_entries.async_update_entry(self._entry, options=data)
 
-        # Trigger reconnect for mode change
-        await self._instance.stop()
-        await self._instance._ensure_connected()
+        # Apply brightness mode which handles reconnection
+        await self._instance.apply_brightness_mode(option)
 
         self.async_write_ha_state()

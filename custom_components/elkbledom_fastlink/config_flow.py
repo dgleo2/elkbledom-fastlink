@@ -53,14 +53,27 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if not discovery_info.address or not discovery_info.name:
             return self.async_abort(reason="invalid_discovery_info")
 
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
-
         # Проверяем имя без использования DeviceData
-        if any(x in discovery_info.name.upper() for x in ["ELK", "LED", "MELK"]):
-            return await self.async_step_bluetooth_confirm()
+        if not any(x in discovery_info.name.upper() for x in ["ELK", "LED", "MELK"]):
+            return self.async_abort(reason="not_supported")
 
-        return self.async_abort(reason="not_supported")
+        await self.async_set_unique_id(discovery_info.address)
+        
+        # Проверяем, есть ли уже конфигурация для этого устройства
+        existing_entries = self.hass.config_entries.async_entries(DOMAIN)
+        for entry in existing_entries:
+            if entry.data.get(CONF_MAC) == discovery_info.address:
+                LOGGER.info(
+                    "Reconnecting offline device: %s (%s)",
+                    discovery_info.name,
+                    discovery_info.address,
+                )
+                # Перезагружаем конфигурацию, чтобы восстановить соединение
+                await self.hass.config_entries.async_reload(entry.entry_id)
+                return self.async_abort(reason="already_configured")
+        
+        self._abort_if_unique_id_configured()
+        return await self.async_step_bluetooth_confirm()
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None

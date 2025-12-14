@@ -5,6 +5,7 @@ from homeassistant.components.light import (
     LightEntity,
     LightEntityFeature,
     ATTR_BRIGHTNESS,
+    ATTR_WHITE,
     ATTR_RGB_COLOR,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
@@ -44,6 +45,7 @@ class BLEDOMLight(LightEntity):
     _attr_min_color_temp_kelvin = 1800
     _attr_max_color_temp_kelvin = 7000
     _attr_supported_features = LightEntityFeature.EFFECT
+    
 
     def __init__(self, instance: BLEDOMInstance, name: str, entry_id: str) -> None:
         self._instance = instance
@@ -51,6 +53,11 @@ class BLEDOMLight(LightEntity):
         self._entry_id = entry_id
         self._attr_unique_id = f"{self._instance.address}_light"
         self._last_color_mode = ColorMode.RGB
+
+        if self._instance._model.lower().startswith("melk-og10"):
+            self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.WHITE}
+        else:
+            self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
 
         # Текущее «сырое» имя эффекта (ключ из const), по умолчанию none
         self._current_effect_key: str = "none"
@@ -98,6 +105,11 @@ class BLEDOMLight(LightEntity):
     @property
     def effect_list(self) -> list[str] | None:
         return self._pretty_effect_list
+    
+    @property
+    def available(self) -> bool:
+        """Return True if device is available."""
+        return self._instance.is_connected
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -115,17 +127,26 @@ class BLEDOMLight(LightEntity):
     async def async_turn_on(self, **kwargs):
         _LOGGER.debug("Turn ON with kwargs: %s", kwargs)
         await self._instance.turn_on()
+        # always power on, as there is no feedback
 
         if ATTR_BRIGHTNESS in kwargs:
             await self._instance.set_brightness(kwargs[ATTR_BRIGHTNESS])
 
         if ATTR_RGB_COLOR in kwargs:
             self._last_color_mode = ColorMode.RGB
+            self._instance._color_mode = "rgb"
             await self._instance.set_color(kwargs[ATTR_RGB_COLOR])
+            self._current_effect_key = "none"
+        
+        if ATTR_WHITE in kwargs:
+            self._last_color_mode = ColorMode.WHITE
+            self._instance._color_mode = "white"
+            await self._instance.set_brightness(kwargs[ATTR_WHITE])
             self._current_effect_key = "none"
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._last_color_mode = ColorMode.COLOR_TEMP
+            self._instance._color_mode = "color_temp"
             await self._instance.set_color_temp_kelvin(kwargs[ATTR_COLOR_TEMP_KELVIN])
             self._current_effect_key = "none"
 
@@ -138,10 +159,12 @@ class BLEDOMLight(LightEntity):
                 effect_id = EFFECTS_MAP[effect_key]
                 await self._instance.set_effect(effect_id)
                 self._current_effect_key = effect_key
+                self._instance._color_mode = "rgb"
                 _LOGGER.debug("Applied effect: key=%s id=0x%02X", effect_key, effect_id)
 
-        if not kwargs:
-            await self._instance.set_color(self._instance.rgb_color)
+        #if not kwargs:
+        #    await self._instance.set_color(self._instance.rgb_color)
+        #Power on with last state
 
         self.async_write_ha_state()
 

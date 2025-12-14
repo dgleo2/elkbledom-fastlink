@@ -30,14 +30,29 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # BLE-названия и настройки
 # ---------------------------------------------------------
-NAME_ARRAY = ["ELK-BLEDDM", "ELK-BLE", "LEDBLE", "MELK", "ELK-BULB2", "ELK-BULB", "ELK-LAMPL"]
+NAME_ARRAY = ["ELK-BLEDDM", "ELK-BLE", "LEDBLE", "MELK-OG10", "MELK", "ELK-BULB2", "ELK-BULB", "ELK-LAMPL"]
 WRITE_CHARACTERISTIC_UUIDS = ["0000fff3-0000-1000-8000-00805f9b34fb"] * 7
-TURN_ON_CMD = [[0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]] * 7
-TURN_OFF_CMD = [[0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]] * 7
+TURN_ON_CMD = [[0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7e, 0x07, 0x04, 0xff, 0x00, 0x01, 0x02, 0x01, 0xef],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
+               [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]]
+
+TURN_OFF_CMD = [[0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7e, 0x07, 0x04, 0x00, 0x00, 0x00, 0x02, 0x01, 0xef],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],
+                [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]]
 
 # Реалистичные диапазоны кельвинов для RGB-эмуляции
-MIN_COLOR_TEMPS_K = [1800] * 7
-MAX_COLOR_TEMPS_K = [7000] * 7
+MIN_COLOR_TEMPS_K = [1800] * 8
+MAX_COLOR_TEMPS_K = [7000] * 8
 
 DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
@@ -81,6 +96,7 @@ class BLEDOMInstance:
             raise ConfigEntryNotReady(f"Bluetooth device {address} not found.")
 
         self._client: BleakClientWithServiceCache | None = None
+        self._is_connected = False
         self._connect_lock = asyncio.Lock()
         self._cached_services: BleakGATTServiceCollection | None = None
         self._write_uuid = None
@@ -99,10 +115,14 @@ class BLEDOMInstance:
 
         self._brightness_mode: str = DEFAULT_BRIGHTNESS_MODE
 
+        self._color_mode = None
+        self._model = None
+        self._delayed_connect_time = 5
+
         self._detect_model()
         asyncio.create_task(self._async_init_state())
         asyncio.create_task(self._delayed_connect())
-        asyncio.create_task(self._heartbeat())
+        LOGGER.debug("%s: BLEDOMInstance initialized", self.name)
 
     # ---------------------------------------------------------
     # JSON-состояние (асинхронно)
@@ -150,6 +170,7 @@ class BLEDOMInstance:
         await self._hass.async_add_executor_job(self._save_state_sync, payload)
 
     async def _async_init_state(self):
+        LOGGER.debug("Loading saved state for %s from %s", self.address, STATE_FILE)
         state = await self._async_load_state()
         self._rgb_color = tuple(state.get("rgb", (255, 255, 255)))  # type: ignore[arg-type]
         self._brightness = int(state.get("brightness", 255))
@@ -201,12 +222,22 @@ class BLEDOMInstance:
     @property
     def color_temp_kelvin(self) -> int:
         return getattr(self, "_color_temp_kelvin", 5000)
+    
+    @property
+    def color_mode(self):
+        return getattr(self, "_color_mode", "rgb")
+    
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the device is currently connected."""
+        return self._is_connected and (self._client is not None and self._client.is_connected)
 
     # ---------------------------------------------------------
     # Подключение BLE
     # ---------------------------------------------------------
     async def _delayed_connect(self):
-        await asyncio.sleep(3)
+        #LOGGER.debug("%s: Delayed connect for %s seconds", self.name, self._delayed_connect_time)
+        await asyncio.sleep(self._delayed_connect_time)
         await self._ensure_connected()
 
     def _detect_model(self):
@@ -216,14 +247,17 @@ class BLEDOMInstance:
                 self._turn_off_cmd = TURN_OFF_CMD[i]
                 self._min_color_temp_kelvin = MIN_COLOR_TEMPS_K[i]
                 self._max_color_temp_kelvin = MAX_COLOR_TEMPS_K[i]
+                self._model = name
                 return
-        self._turn_on_cmd = TURN_ON_CMD[0]
-        self._turn_off_cmd = TURN_OFF_CMD[0]
+
 
     async def _ensure_connected(self):
-        if self._client and self._client.is_connected:
-            return
+        #LOGGER.debug("%s: ensure connected for: %s with status: %s", self.name, self._client, self._is_connected)
         async with self._connect_lock:
+            # Double-check after acquiring lock
+            if self._client and self._client.is_connected:
+                self._is_connected = True
+                return
             try:
                 client = await establish_connection(
                     BleakClientWithServiceCache,
@@ -240,19 +274,17 @@ class BLEDOMInstance:
                         self._write_uuid = c
                         break
                 LOGGER.info("%s connected", self._device.name)
+                self._is_connected = True
             except Exception as e:
                 LOGGER.error("%s: connection failed: %s", self._device.name, e)
-                await asyncio.sleep(5)
-                asyncio.create_task(self._ensure_connected())
+                self._is_connected = False
+                #await asyncio.sleep(5)
+                #asyncio.create_task(self._ensure_connected())
 
     def _disconnected(self, _client):
+        """Handle disconnection callback from BLE client."""
+        self._is_connected = False
         asyncio.create_task(self._ensure_connected())
-
-    async def _heartbeat(self):
-        while True:
-            if not self._client or not self._client.is_connected:
-                await self._ensure_connected()
-            await asyncio.sleep(30)
 
     # ---------------------------------------------------------
     # BLE-команды
@@ -261,13 +293,17 @@ class BLEDOMInstance:
     async def _write(self, data: list[int]):
         await self._ensure_connected()
         await self._client.write_gatt_char(self._write_uuid, bytearray(data), False)
+        LOGGER.debug("sending data to %s: %s", self.name, data)
 
     @retry_bluetooth_connection_error
     async def turn_on(self):
-        await self._write(self._turn_on_cmd)
-        await asyncio.sleep(0.2)
-        await self.set_color(self._rgb_color, self._brightness)
-        self._is_on = True
+            await self._write(self._turn_on_cmd)
+            #avoid changing to color when set to white mode
+            if self._color_mode != "white":
+                await asyncio.sleep(0.2)
+                await self.set_color(self._rgb_color, self._brightness)
+            self._is_on = True
+            await self._async_save_state()
 
     @retry_bluetooth_connection_error
     async def turn_off(self):
@@ -277,7 +313,11 @@ class BLEDOMInstance:
 
     async def _write_native_brightness(self, percent: int):
         p = max(0, min(int(percent), 100))
-        await self._write([0x7E, 0x04, 0x01, p, 0xFF, 0x00, 0xFF, 0x00, 0xEF])
+        LOGGER.debug("color mode = %s with value (%d)", self._color_mode, p)
+        if self._color_mode == "white" and self.name.lower().startswith("melk-og10"):           
+            await self._write([0x7e, 0x07, 0x05, 0x01, p, 0xff, 0x02, 0x01, 0xef])
+        else:
+            await self._write([0x7E, 0x04, 0x01, p, 0xFF, 0x00, 0xFF, 0x00, 0xEF])
 
     @retry_bluetooth_connection_error
     async def set_brightness(self, value: int):
@@ -285,22 +325,32 @@ class BLEDOMInstance:
         r, g, b = self._rgb_color
         percent = round(self._brightness * 100 / 255)
         mode = (self._brightness_mode or DEFAULT_BRIGHTNESS_MODE).lower()
+        #LOGGER.debug("%s: brightness mode = %s with value (%s%%)", self.name, mode, percent)
 
         async def write_rgb_scaled():
             scale = self._brightness / 255.0
             rr, gg, bb = int(r * scale), int(g * scale), int(b * scale)
-            await self._write([0x7E, 0x00, 0x05, 0x03, rr, gg, bb, 0x00, 0xEF])
+            LOGGER.debug("color mode = %s with value (%d)", self._color_mode, rr)
+            if self._color_mode == "white" and self.name.lower().startswith("melk-og10"):           
+                await self._write([0x7e, 0x07, 0x05, 0x01, int(rr), 0xff, 0x02, 0x01, 0xef])
+            else:
+                await self._write([0x7E, 0x00, 0x05, 0x03, rr, gg, bb, 0x00, 0xEF])
 
+            
         async def write_native_then_rgb():
-            await self._write_native_brightness(percent)
-            await asyncio.sleep(0.05)
-            await self._write([0x7E, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xEF])
-
+            LOGGER.debug("color mode = %s with value (%d)", self._color_mode, percent)
+            if self._color_mode == "white" and self.name.lower().startswith("melk-og10"):           
+                await self._write([0x7e, 0x07, 0x05, 0x01, percent, 0xff, 0x02, 0x01, 0xef])
+            else:
+                await self._write_native_brightness(percent)
+                await asyncio.sleep(0.05)
+                await self._write([0x7E, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xEF])
+        
         try:
             if mode == "rgb":
                 await write_rgb_scaled()
             elif mode == "native":
-                await write_native_then_rgb()
+                await self._write_native_brightness(percent)
             else:
                 try:
                     await write_native_then_rgb()
@@ -344,6 +394,7 @@ class BLEDOMInstance:
             self._brightness = max(1, min(int(brightness), 255))
 
         await self.set_color((r, g, b), self._brightness)
+        await self._async_save_state()
 
     @retry_bluetooth_connection_error
     async def set_effect(self, value: int):
@@ -357,6 +408,8 @@ class BLEDOMInstance:
             self._last_effect = value
         except Exception as e:
             LOGGER.error("%s: set_effect error: %s", self.name, e)
+        finally: 
+            await self._async_save_state()
 
     @retry_bluetooth_connection_error
     async def set_effect_speed(self, speed: int):
