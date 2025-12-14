@@ -54,23 +54,44 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if not discovery_info.address or not discovery_info.name:
             return self.async_abort(reason="invalid_discovery_info")
 
-        # Check device name without using DeviceData
-        if not any(x in discovery_info.name.upper() for x in ["ELK", "LED", "MELK"]):
+        # Check device name - case insensitive
+        device_name_upper = discovery_info.name.upper()
+        supported_prefixes = ["ELK-BLEDDM", "ELK-BULB2", "ELK-BULB", "ELK-BLE", "MELK", "LEDBLE", "ELK-LAMPL"]
+        is_supported = any(device_name_upper.startswith(prefix.upper()) for prefix in supported_prefixes)
+        
+        if not is_supported:
+            LOGGER.debug("Device %s not supported (name: %s)", discovery_info.address, discovery_info.name)
             return self.async_abort(reason="not_supported")
 
         await self.async_set_unique_id(discovery_info.address)
         
-        # Check if configuration already exists for this device
+         # Check if configuration already exists for this device
         existing_entries = self.hass.config_entries.async_entries(DOMAIN)
         for entry in existing_entries:
             if entry.data.get(CONF_MAC) == discovery_info.address:
                 LOGGER.info(
-                    "Reconnecting offline device: %s (%s)",
+                    "Rediscovered device: %s (%s)",
                     discovery_info.name,
                     discovery_info.address,
                 )
-                # Reload configuration to restore connection
-                await self.hass.config_entries.async_reload(entry.entry_id)
+                
+                # Try to reconnect directly if instance exists
+                if DOMAIN in self.hass.data and entry.entry_id in self.hass.data[DOMAIN]:
+                    device_instance = self.hass.data[DOMAIN][entry.entry_id]
+                    
+                    # Check if already connecting to avoid duplicate attempts
+                    if device_instance._reconnect_task_scheduled or device_instance._connecting:
+                        LOGGER.debug(
+                            "%s: Already attempting connection, skipping rediscovery reconnect",
+                            discovery_info.address
+                        )
+                        return self.async_abort(reason="already_configured")
+                    
+                    # Trigger reconnection in background with retry logic
+                    LOGGER.debug("Triggering reconnection for %s via discovery", discovery_info.address)
+                    device_instance._reconnect_task_scheduled = True
+                    asyncio.create_task(device_instance._async_reconnect_with_retry())
+                
                 return self.async_abort(reason="already_configured")
         
         self._abort_if_unique_id_configured()
@@ -81,6 +102,7 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             "name": discovery_info.name
         })
         return await self.async_step_bluetooth_confirm()
+
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None

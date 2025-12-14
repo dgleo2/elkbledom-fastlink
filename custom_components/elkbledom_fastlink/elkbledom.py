@@ -31,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 # BLE-названия и настройки
 # ---------------------------------------------------------
 NAME_ARRAY = ["ELK-BLEDDM", "ELK-BLE", "LEDBLE", "MELK-OG10", "MELK", "ELK-BULB2", "ELK-BULB", "ELK-LAMPL"]
-WRITE_CHARACTERISTIC_UUIDS = ["0000fff3-0000-1000-8000-00805f9b34fb"] * 7
+WRITE_CHARACTERISTIC_UUIDS = ["0000fff3-0000-1000-8000-00805f9b34fb"] * 8
 TURN_ON_CMD = [[0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
                [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
                [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],
@@ -98,6 +98,8 @@ class BLEDOMInstance:
         self._client: BleakClientWithServiceCache | None = None
         self._is_connected = False
         self._connect_lock = asyncio.Lock()
+        self._connecting = False  # Track if reconnection is in progress
+        self._reconnect_task_scheduled = False  # Prevent duplicate reconnection tasks
         self._cached_services: BleakGATTServiceCollection | None = None
         self._write_uuid = None
 
@@ -154,6 +156,7 @@ class BLEDOMInstance:
 
             if payload is None:
                 payload = {
+                    "is_on": self._is_on,
                     "rgb": self._rgb_color,
                     "brightness": self._brightness,
                     "color_temp": self._color_temp_kelvin,
@@ -172,6 +175,7 @@ class BLEDOMInstance:
     async def _async_init_state(self):
         LOGGER.debug("Loading saved state for %s from %s", self.address, STATE_FILE)
         state = await self._async_load_state()
+        self._is_on = bool(state.get("is_on", False))
         self._rgb_color = tuple(state.get("rgb", (255, 255, 255)))  # type: ignore[arg-type]
         self._brightness = int(state.get("brightness", 255))
         self._color_temp_kelvin = int(state.get("color_temp", 5000))
@@ -236,9 +240,13 @@ class BLEDOMInstance:
     # Подключение BLE
     # ---------------------------------------------------------
     async def _delayed_connect(self):
-        #LOGGER.debug("%s: Delayed connect for %s seconds", self.name, self._delayed_connect_time)
-        await asyncio.sleep(self._delayed_connect_time)
-        await self._ensure_connected()
+        """Attempt initial connection after a delay. Errors are non-fatal."""
+        try:
+            await asyncio.sleep(self._delayed_connect_time)
+            await self._ensure_connected()
+        except Exception as e:
+            LOGGER.debug("%s: Initial connection failed (will retry on next command): %s", self.name, e)
+            self._is_connected = False
 
     def _detect_model(self):
         for i, name in enumerate(NAME_ARRAY):
@@ -252,39 +260,127 @@ class BLEDOMInstance:
 
 
     async def _ensure_connected(self):
-        #LOGGER.debug("%s: ensure connected for: %s with status: %s", self.name, self._client, self._is_connected)
-        async with self._connect_lock:
-            # Double-check after acquiring lock
-            if self._client and self._client.is_connected:
-                self._is_connected = True
-                return
-            try:
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    self._device,
-                    self._device.name,
-                    self._disconnected,
-                    cached_services=self._cached_services,
-                )
-                self._client = client
-                self._cached_services = client.services
-                for ch in WRITE_CHARACTERISTIC_UUIDS:
-                    c = client.services.get_characteristic(ch)
-                    if c:
-                        self._write_uuid = c
-                        break
-                LOGGER.info("%s connected", self._device.name)
-                self._is_connected = True
-            except Exception as e:
-                LOGGER.error("%s: connection failed: %s", self._device.name, e)
-                self._is_connected = False
-                #await asyncio.sleep(5)
-                #asyncio.create_task(self._ensure_connected())
+        """Ensure device is connected, avoiding redundant connection attempts."""
+        # Quick check before acquiring lock
+        if self._client and self._client.is_connected:
+            self._is_connected = True
+            return
+        
+        # If already connecting, don't attempt again
+        if self._connecting:
+            LOGGER.debug("%s: Connection already in progress, skipping", self.name)
+            return
+        
+        self._connecting = True
+        try:
+            async with self._connect_lock:
+                # Double-check after acquiring lock
+                if self._client and self._client.is_connected:
+                    self._is_connected = True
+                    LOGGER.debug("%s: Already connected after lock acquired", self.name)
+                    return
+                
+                try:
+                    LOGGER.debug("%s: Establishing BLE connection", self.name)
+                    client = await asyncio.wait_for(
+                        establish_connection(
+                            BleakClientWithServiceCache,
+                            self._device,
+                            self._device.name,
+                            self._disconnected,
+                            cached_services=self._cached_services,
+                        ),
+                        timeout=10.0
+                    )
+                    self._client = client
+                    self._cached_services = client.services
+                    for ch in WRITE_CHARACTERISTIC_UUIDS:
+                        c = client.services.get_characteristic(ch)
+                        if c:
+                            self._write_uuid = c
+                            break
+                    self._is_connected = True
+                    LOGGER.info("%s connected", self._device.name)
+                    # Restore power state after successful connection
+                    await self._async_restore_power_state()
+                except asyncio.TimeoutError:
+                    LOGGER.debug("%s: Connection timeout (10s)", self._device.name)
+                    self._is_connected = False
+                    raise
+                except Exception as e:
+                    LOGGER.debug("%s: connection failed: %s", self._device.name, e)
+                    self._is_connected = False
+                    raise
+        finally:
+            self._connecting = False
+
+    async def _async_restore_power_state(self):
+        """Restore power state after reconnection."""
+        try:
+            await asyncio.sleep(0.5)  # Small delay to allow device to be ready
+            if self._is_on:
+                LOGGER.debug("%s: Restoring power ON state", self.name)
+                await self._write(self._turn_on_cmd)
+            else:
+                LOGGER.debug("%s: Restoring power OFF state", self.name)
+                await self._write(self._turn_off_cmd)
+        except Exception as e:
+            LOGGER.debug("%s: Failed to restore power state: %s", self.name, e)
 
     def _disconnected(self, _client):
         """Handle disconnection callback from BLE client."""
+        LOGGER.info("%s: Disconnected", self.name)
         self._is_connected = False
-        asyncio.create_task(self._ensure_connected())
+        
+        # Prevent duplicate reconnection tasks (callback may fire multiple times)
+        if self._reconnect_task_scheduled:
+            LOGGER.debug("%s: Reconnection task already scheduled, skipping duplicate", self.name)
+            return
+        
+        self._reconnect_task_scheduled = True
+        asyncio.create_task(self._async_reconnect_with_retry())
+
+    async def _async_reconnect_with_retry(self):
+        """Attempt reconnection with exponential backoff and max attempts."""
+        max_attempts = 4  # Fewer attempts with longer delays
+        attempt = 0
+        
+        while attempt < max_attempts:
+            if not await self._async_can_reconnect():
+                # Device no longer reachable, wait for rediscovery
+                LOGGER.info("%s: Device not reachable, waiting for Bluetooth rediscovery", self.name)
+                break
+            
+            attempt += 1
+            # Longer delays: 5, 15, 30, 50 seconds - gives proxy time to cleanup
+            delays = [5, 15, 30, 50]
+            delay = delays[attempt - 1]
+            
+            LOGGER.debug("%s: Reconnection attempt %d/%d (waiting %ds first)", 
+                        self.name, attempt, max_attempts, delay)
+            await asyncio.sleep(delay)
+            
+            try:
+                await self._ensure_connected()
+                LOGGER.info("%s: Successfully reconnected", self.name)
+                self._reconnect_task_scheduled = False
+                return
+            except Exception as e:
+                LOGGER.debug("%s: Reconnection attempt %d failed: %s", self.name, attempt, e)
+        
+        # All attempts exhausted
+        LOGGER.info("%s: Reconnection exhausted after %d attempts, waiting for rediscovery", 
+                   self.name, max_attempts)
+        self._reconnect_task_scheduled = False
+
+    async def _async_can_reconnect(self) -> bool:
+        """Check if device is still reachable by Bluetooth proxy."""
+        try:
+            device = async_ble_device_from_address(self._hass, self.address)
+            return device is not None
+        except Exception:
+            return False
+
 
     # ---------------------------------------------------------
     # BLE-команды
