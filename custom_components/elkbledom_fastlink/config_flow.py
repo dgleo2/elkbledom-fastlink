@@ -28,7 +28,7 @@ MANUAL_MAC = "manual"
 
 
 class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
-    """Основной поток настройки интеграции ELK-BLEDOM FastLink."""
+    """Main configuration flow for ELK-BLEDOM FastLink integration."""
     VERSION = 1
     CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
 
@@ -36,14 +36,15 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self.mac: str | None = None
         self.name: str | None = None
         self._discovered_devices: list[dict[str, str]] = []
+        self._discovery_info: BluetoothServiceInfoBleak | None = None
 
     # =========================================================
-    # Автообнаружение Bluetooth
+    # Bluetooth Auto-Discovery
     # =========================================================
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> FlowResult:
-        """Обработка найденного BLE устройства."""
+        """Handle discovered BLE device."""
         LOGGER.debug(
             "Discovered Bluetooth device: %s (%s)",
             discovery_info.name,
@@ -53,13 +54,13 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if not discovery_info.address or not discovery_info.name:
             return self.async_abort(reason="invalid_discovery_info")
 
-        # Проверяем имя без использования DeviceData
+        # Check device name without using DeviceData
         if not any(x in discovery_info.name.upper() for x in ["ELK", "LED", "MELK"]):
             return self.async_abort(reason="not_supported")
 
         await self.async_set_unique_id(discovery_info.address)
         
-        # Проверяем, есть ли уже конфигурация для этого устройства
+        # Check if configuration already exists for this device
         existing_entries = self.hass.config_entries.async_entries(DOMAIN)
         for entry in existing_entries:
             if entry.data.get(CONF_MAC) == discovery_info.address:
@@ -68,27 +69,33 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     discovery_info.name,
                     discovery_info.address,
                 )
-                # Перезагружаем конфигурацию, чтобы восстановить соединение
+                # Reload configuration to restore connection
                 await self.hass.config_entries.async_reload(entry.entry_id)
                 return self.async_abort(reason="already_configured")
         
         self._abort_if_unique_id_configured()
+        # Store discovered device information
+        self._discovery_info = discovery_info
+        self._discovered_devices.append({
+            "address": discovery_info.address,
+            "name": discovery_info.name
+        })
         return await self.async_step_bluetooth_confirm()
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Подтверждение добавления BLE устройства."""
+        """Confirm adding BLE device."""
         self._set_confirm_only()
         return await self.async_step_user()
 
     # =========================================================
-    # Выбор устройства вручную или из списка
+    # Manual Device Selection or From List
     # =========================================================
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Выбор устройства из списка или ввод MAC вручную."""
+        """Select device from list or enter MAC address manually."""
         if user_input is not None:
             if user_input[CONF_MAC] == MANUAL_MAC:
                 return await self.async_step_manual()
@@ -103,17 +110,16 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             return await self.async_step_validate()
 
-        # Сканируем BLE устройства
-        current_addresses = self._async_current_ids()
-        discovered_devices = async_discovered_service_info(self.hass)
+        # Scan for BLE devices (if not already added via Bluetooth discovery)
+        if not self._discovered_devices:
+            current_addresses = self._async_current_ids()
+            discovered_devices = async_discovered_service_info(self.hass)
 
-        for d in discovered_devices:
-            if d.address in current_addresses:
-                continue
-            if any(dev["address"] == d.address for dev in self._discovered_devices):
-                continue
-            if d.name and any(x in d.name.upper() for x in ["ELK", "LED", "MELK"]):
-                self._discovered_devices.append({"address": d.address, "name": d.name})
+            for d in discovered_devices:
+                if d.address in current_addresses:
+                    continue
+                if d.name and any(x in d.name.upper() for x in ["ELK", "LED", "MELK"]):
+                    self._discovered_devices.append({"address": d.address, "name": d.name})
 
         if not self._discovered_devices:
             return await self.async_step_manual()
@@ -133,12 +139,12 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     # =========================================================
-    # Проверка доступности устройства
+    # Device Availability Check
     # =========================================================
     async def async_step_validate(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Проверка, что устройство доступно по BLE адресу."""
+        """Verify that device is accessible via BLE address."""
         LOGGER.debug("Validating device: %s (%s)", self.name, self.mac)
 
         try:
@@ -165,12 +171,12 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="cannot_connect")
 
     # =========================================================
-    # Ввод MAC вручную
+    # Manual MAC Address Entry
     # =========================================================
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Ручной ввод MAC адреса."""
+        """Manual MAC address entry."""
         if user_input is not None:
             self.mac = format_mac(user_input[CONF_MAC])
             self.name = user_input["name"]
@@ -188,31 +194,31 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     # =========================================================
-    # Опции интеграции
+    # Integration Options
     # =========================================================
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry):
-        """Возврат обработчика опций."""
+        """Return options flow handler."""
         return OptionsFlowHandler(config_entry)
 
 
 # =========================================================
-# Меню опций интеграции (Options Flow)
+# Integration Options Menu (Options Flow)
 # =========================================================
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    """Меню настроек интеграции."""
+    """Integration settings menu."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         super().__init__()
         self._config_entry = config_entry
 
     async def async_step_init(self, _user_input=None):
-        """Начальный шаг."""
+        """Initial step."""
         return await self.async_step_user()
 
     async def async_step_user(self, user_input=None):
-        """Основной экран опций."""
+        """Main options screen."""
         errors = {}
         options = self._config_entry.options or {
             CONF_RESET: False,
