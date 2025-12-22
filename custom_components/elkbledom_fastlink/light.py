@@ -54,7 +54,8 @@ class BLEDOMLight(LightEntity):
         self._attr_unique_id = f"{self._instance.address}_light"
         self._last_color_mode = ColorMode.RGB
 
-        if self._instance._model.lower().startswith("melk-og10"):
+        model_name = (self._instance._model or "").lower()
+        if model_name.startswith("melk-og10"):
             self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.WHITE}
         else:
             self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}

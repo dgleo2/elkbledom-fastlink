@@ -22,7 +22,6 @@ from bleak_retry_connector import (
     establish_connection,
 )
 from homeassistant.components.bluetooth import async_ble_device_from_address
-from homeassistant.exceptions import ConfigEntryNotReady
 from .const import DEFAULT_BRIGHTNESS_MODE
 
 LOGGER = logging.getLogger(__name__)
@@ -93,7 +92,10 @@ class BLEDOMInstance:
 
         self._device = async_ble_device_from_address(hass, address)
         if not self._device:
-            raise ConfigEntryNotReady(f"Bluetooth device {address} not found.")
+            LOGGER.warning(
+                "%s: Bluetooth device not currently available; starting offline until discovered",
+                address,
+            )
 
         self._client: BleakClientWithServiceCache | None = None
         self._is_connected = False
@@ -243,14 +245,26 @@ class BLEDOMInstance:
         """Attempt initial connection after a delay. Errors are non-fatal."""
         try:
             await asyncio.sleep(self._delayed_connect_time)
+            self._device = self._device or async_ble_device_from_address(self._hass, self.address)
+            if not self._device:
+                LOGGER.debug("%s: Initial connection skipped; device not found yet", self.address)
+                self._is_connected = False
+                return
             await self._ensure_connected()
         except Exception as e:
             LOGGER.debug("%s: Initial connection failed (will retry on next command): %s", self.name, e)
             self._is_connected = False
 
     def _detect_model(self):
+        device = self._device or async_ble_device_from_address(self._hass, self.address)
+        if device:
+            self._device = device
+            dev_name = (device.name or "").lower()
+        else:
+            dev_name = ""
+
         for i, name in enumerate(NAME_ARRAY):
-            if self._device.name and self._device.name.lower().startswith(name.lower()):
+            if dev_name.startswith(name.lower()):
                 self._turn_on_cmd = TURN_ON_CMD[i]
                 self._turn_off_cmd = TURN_OFF_CMD[i]
                 self._min_color_temp_kelvin = MIN_COLOR_TEMPS_K[i]
@@ -258,9 +272,24 @@ class BLEDOMInstance:
                 self._model = name
                 return
 
+        # Fallback defaults if model is unknown or device not yet seen
+        self._turn_on_cmd = TURN_ON_CMD[0]
+        self._turn_off_cmd = TURN_OFF_CMD[0]
+        self._min_color_temp_kelvin = MIN_COLOR_TEMPS_K[0]
+        self._max_color_temp_kelvin = MAX_COLOR_TEMPS_K[0]
+        self._model = None
+
 
     async def _ensure_connected(self):
         """Ensure device is connected, avoiding redundant connection attempts."""
+        device = self._device or async_ble_device_from_address(self._hass, self.address)
+        if not device:
+            self._is_connected = False
+            raise BleakNotFoundError(self.address)
+
+        self._device = device
+        self._detect_model()
+
         # Quick check before acquiring lock
         if self._client and self._client.is_connected:
             self._is_connected = True
@@ -285,8 +314,8 @@ class BLEDOMInstance:
                     client = await asyncio.wait_for(
                         establish_connection(
                             BleakClientWithServiceCache,
-                            self._device,
-                            self._device.name,
+                            device,
+                            device.name or self.address,
                             self._disconnected,
                             cached_services=self._cached_services,
                         ),
