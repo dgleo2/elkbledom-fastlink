@@ -137,6 +137,8 @@ class BLEDOMInstance:
         """Create a background task and track it for cleanup."""
         if self._is_shutting_down:
             LOGGER.debug("%s: Skipping task creation during shutdown", self.name)
+            # Close the coroutine to prevent "was never awaited" warning
+            coro.close()
             return None
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
