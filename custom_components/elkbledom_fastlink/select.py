@@ -32,6 +32,17 @@ class BLEDOMBrightnessModeSelect(SelectEntity):
         self._attr_name = f"{entry.data.get('name', 'ELK-BLEDOM')} Brightness Mode"
         self._attr_unique_id = f"{instance.address}_brightness_mode"
         self._current_option = entry.options.get(CONF_BRIGHTNESS_MODE, "auto")
+        # Register callback for connection state changes
+        self._instance.register_connection_callback(self._on_connection_changed)
+
+    def _on_connection_changed(self):
+        """Called when device connection state changes."""
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Device is available if BLE client is connected."""
+        return self._instance.is_connected
 
     @property
     def current_option(self) -> str:

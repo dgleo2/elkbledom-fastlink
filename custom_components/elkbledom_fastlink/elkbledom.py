@@ -100,8 +100,13 @@ class BLEDOMInstance:
         self._client: BleakClientWithServiceCache | None = None
         self._is_connected = False
         self._connect_lock = asyncio.Lock()
+        self._connect_event = asyncio.Event()  # Signal when connection completes
         self._connecting = False  # Track if reconnection is in progress
         self._reconnect_task_scheduled = False  # Prevent duplicate reconnection tasks
+        self._ever_connected = False  # True only after first successful connection
+        self._is_shutting_down = False  # Prevent new tasks during shutdown
+        self._background_tasks: set = set()  # Track all background tasks for cleanup
+        self._connection_callbacks: list = []  # Callbacks when connection state changes
         self._cached_services: BleakGATTServiceCollection | None = None
         self._write_uuid = None
 
@@ -124,9 +129,43 @@ class BLEDOMInstance:
         self._delayed_connect_time = 5
 
         self._detect_model()
-        asyncio.create_task(self._async_init_state())
-        asyncio.create_task(self._delayed_connect())
+        self._create_task(self._async_init_state())
+        self._create_task(self._delayed_connect())
         LOGGER.debug("%s: BLEDOMInstance initialized", self.name)
+
+    def _create_task(self, coro):
+        """Create a background task and track it for cleanup."""
+        if self._is_shutting_down:
+            LOGGER.debug("%s: Skipping task creation during shutdown", self.name)
+            return None
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def register_connection_callback(self, callback):
+        """Register callback to be called when connection state changes."""
+        if callback not in self._connection_callbacks:
+            self._connection_callbacks.append(callback)
+
+    def unregister_connection_callback(self, callback):
+        """Unregister connection state change callback."""
+        self._connection_callbacks.discard(callback) if isinstance(self._connection_callbacks, set) else None
+        try:
+            self._connection_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def _notify_connection_change(self):
+        """Notify all registered callbacks about connection state change."""
+        for callback in self._connection_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    self._create_task(callback())
+                else:
+                    callback()
+            except Exception as e:
+                LOGGER.debug("%s: Error in connection callback: %s", self.name, e)
 
     # ---------------------------------------------------------
     # JSON-состояние (асинхронно)
@@ -163,6 +202,7 @@ class BLEDOMInstance:
                     "brightness": self._brightness,
                     "color_temp": self._color_temp_kelvin,
                     "brightness_mode": self._brightness_mode,
+                    "model": self._model,
                 }
 
             data[self.address] = payload
@@ -182,6 +222,7 @@ class BLEDOMInstance:
         self._brightness = int(state.get("brightness", 255))
         self._color_temp_kelvin = int(state.get("color_temp", 5000))
         self._brightness_mode = str(state.get("brightness_mode", DEFAULT_BRIGHTNESS_MODE))
+        self._model = str(state.get("model", self._model))
 
     # ---------------------------------------------------------
     # Режим яркости и переподключение
@@ -245,12 +286,17 @@ class BLEDOMInstance:
         """Attempt initial connection after a delay. Errors are non-fatal."""
         try:
             await asyncio.sleep(self._delayed_connect_time)
+            if self._is_shutting_down:
+                LOGGER.debug("%s: Skipping delayed connect during shutdown", self.name)
+                return
             self._device = self._device or async_ble_device_from_address(self._hass, self.address)
             if not self._device:
                 LOGGER.debug("%s: Initial connection skipped; device not found yet", self.address)
                 self._is_connected = False
                 return
             await self._ensure_connected()
+        except asyncio.CancelledError:
+            LOGGER.debug("%s: Delayed connect cancelled", self.name)
         except Exception as e:
             LOGGER.debug("%s: Initial connection failed (will retry on next command): %s", self.name, e)
             self._is_connected = False
@@ -272,13 +318,6 @@ class BLEDOMInstance:
                 self._model = name
                 return
 
-        # Fallback defaults if model is unknown or device not yet seen
-        self._turn_on_cmd = TURN_ON_CMD[0]
-        self._turn_off_cmd = TURN_OFF_CMD[0]
-        self._min_color_temp_kelvin = MIN_COLOR_TEMPS_K[0]
-        self._max_color_temp_kelvin = MAX_COLOR_TEMPS_K[0]
-        self._model = None
-
 
     async def _ensure_connected(self):
         """Ensure device is connected, avoiding redundant connection attempts."""
@@ -295,10 +334,20 @@ class BLEDOMInstance:
             self._is_connected = True
             return
         
-        # If already connecting, don't attempt again
+        # If already connecting, wait for it to complete
         if self._connecting:
-            LOGGER.debug("%s: Connection already in progress, skipping", self.name)
-            return
+            LOGGER.debug("%s: Connection already in progress, waiting...", self.name)
+            try:
+                # Wait with timeout for connection to complete
+                await asyncio.wait_for(self._connect_event.wait(), timeout=15.0)
+                if self._client and self._client.is_connected:
+                    self._is_connected = True
+                    LOGGER.debug("%s: Connected after waiting", self.name)
+                    return
+                else:
+                    raise Exception("Connection attempt failed")
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(f"{self.name}: Timed out waiting for in-progress connection")
         
         self._connecting = True
         try:
@@ -329,9 +378,11 @@ class BLEDOMInstance:
                             self._write_uuid = c
                             break
                     self._is_connected = True
+                    self._ever_connected = True  # Mark as successfully connected at least once
                     LOGGER.info("%s connected", self._device.name)
-                    # Restore power state after successful connection
-                    await self._async_restore_power_state()
+                    self._notify_connection_change()  # Notify entities that device is now available
+                    # Restore power state in background without blocking entity creation
+                    self._create_task(self._async_restore_power_state())
                 except asyncio.TimeoutError:
                     LOGGER.debug("%s: Connection timeout (10s)", self._device.name)
                     self._is_connected = False
@@ -342,6 +393,7 @@ class BLEDOMInstance:
                     raise
         finally:
             self._connecting = False
+            self._connect_event.set()  # Signal connection attempt completed
 
     async def _async_restore_power_state(self):
         """Restore power state after reconnection."""
@@ -360,6 +412,14 @@ class BLEDOMInstance:
         """Handle disconnection callback from BLE client."""
         LOGGER.info("%s: Disconnected", self.name)
         self._is_connected = False
+        self._notify_connection_change()  # Notify entities that device is now unavailable
+        self._connect_event.clear()  # Clear event so waiting calls will wait again
+        
+        # Only attempt reconnection if we've ever successfully connected
+        # (avoids multiple reconnection attempts during initialization)
+        if not self._ever_connected:
+            LOGGER.debug("%s: Never successfully connected; skipping automatic reconnection", self.name)
+            return
         
         # Prevent duplicate reconnection tasks (callback may fire multiple times)
         if self._reconnect_task_scheduled:
@@ -367,7 +427,7 @@ class BLEDOMInstance:
             return
         
         self._reconnect_task_scheduled = True
-        asyncio.create_task(self._async_reconnect_with_retry())
+        self._create_task(self._async_reconnect_with_retry())
 
     async def _async_reconnect_with_retry(self):
         """Attempt reconnection with exponential backoff and max attempts."""
@@ -375,9 +435,14 @@ class BLEDOMInstance:
         attempt = 0
         
         while attempt < max_attempts:
+            if self._is_shutting_down:
+                LOGGER.debug("%s: Reconnection cancelled during shutdown", self.name)
+                self._reconnect_task_scheduled = False
+                return
+            
             if not await self._async_can_reconnect():
                 # Device no longer reachable, wait for rediscovery
-                LOGGER.info("%s: Device not reachable, waiting for Bluetooth rediscovery", self.name)
+                LOGGER.debug("%s: Device not reachable, waiting for Bluetooth rediscovery", self.name)
                 break
             
             attempt += 1
@@ -387,18 +452,24 @@ class BLEDOMInstance:
             
             LOGGER.debug("%s: Reconnection attempt %d/%d (waiting %ds first)", 
                         self.name, attempt, max_attempts, delay)
-            await asyncio.sleep(delay)
+            
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                LOGGER.debug("%s: Reconnection sleep cancelled", self.name)
+                self._reconnect_task_scheduled = False
+                return
             
             try:
                 await self._ensure_connected()
-                LOGGER.info("%s: Successfully reconnected", self.name)
+                LOGGER.debug("%s: Successfully reconnected", self.name)
                 self._reconnect_task_scheduled = False
                 return
             except Exception as e:
                 LOGGER.debug("%s: Reconnection attempt %d failed: %s", self.name, attempt, e)
         
         # All attempts exhausted
-        LOGGER.info("%s: Reconnection exhausted after %d attempts, waiting for rediscovery", 
+        LOGGER.debug("%s: Reconnection exhausted after %d attempts, waiting for rediscovery", 
                    self.name, max_attempts)
         self._reconnect_task_scheduled = False
 
@@ -543,6 +614,25 @@ class BLEDOMInstance:
         await self._write([0x7E, 0x00, 0x02, s, 0x03, 0x00, 0x00, 0x00, 0xEF])
 
     async def stop(self):
+        """Stop the device and clean up all resources."""
+        LOGGER.debug("%s: Stopping device", self.name)
+        self._is_shutting_down = True
+        self._reconnect_task_scheduled = False  # Prevent new reconnection tasks
+        
+        # Cancel all background tasks
+        for task in list(self._background_tasks):
+            if not task.done():
+                LOGGER.debug("%s: Cancelling task %s", self.name, task.get_name())
+                task.cancel()
+        
+        # Wait for all tasks to complete
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        
+        # Save state and disconnect
         await self._async_save_state()
         if self._client and self._client.is_connected:
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except Exception as e:
+                LOGGER.debug("%s: Error disconnecting: %s", self.name, e)

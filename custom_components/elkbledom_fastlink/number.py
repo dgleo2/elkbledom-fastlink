@@ -41,11 +41,17 @@ class BLEDOMSpeedControl(NumberEntity):
         self._attr_unique_id = f"{self._instance.address}_speed"
         self._effect_speed = getattr(self._instance, "_effect_speed", 16)
         self._entry_id = entry_id
+        # Register callback for connection state changes
+        self._instance.register_connection_callback(self._on_connection_changed)
+
+    def _on_connection_changed(self):
+        """Called when device connection state changes."""
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
         """Device is available if BLE client is connected."""
-        return bool(getattr(self._instance, "_client", None) and self._instance._client.is_connected)
+        return self._instance.is_connected
 
     @property
     def native_value(self) -> int:

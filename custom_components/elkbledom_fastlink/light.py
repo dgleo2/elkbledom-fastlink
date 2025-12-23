@@ -74,6 +74,13 @@ class BLEDOMLight(LightEntity):
         # обратная мапа: красивая строка -> «сырой» ключ
         self._pretty2key = {v: k for k, v in self._key2pretty.items()}
 
+        # Register callback for connection state changes
+        self._instance.register_connection_callback(self._on_connection_changed)
+
+    def _on_connection_changed(self):
+        """Called when device connection state changes."""
+        self.async_write_ha_state()
+
     # -----------------------
     # Обязательные свойства
     # -----------------------
